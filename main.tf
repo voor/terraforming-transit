@@ -15,6 +15,14 @@ variable "env_name" {}
 
 variable "dns_suffix" {}
 
+variable "squid_docker_image" {
+  default = "voor/squid4"
+}
+
+variable "pcf_vpc_id" {
+  default = ""
+}
+
 variable "availability_zones" {
   type = "list"
 }
@@ -154,4 +162,161 @@ module "cidr_lookup" {
 locals {
   infrastructure_cidr = "${module.cidr_lookup.infrastructure_cidr}"
   public_cidr         = "${module.cidr_lookup.public_cidr}"
+}
+
+resource "aws_vpc_peering_connection" "vpc_peering" {
+  count       = "${var.pcf_vpc_id != "" ? 1 : 0}"
+  peer_vpc_id = "${var.pcf_vpc_id}"
+  vpc_id      = "${aws_vpc.vpc.id}"
+  auto_accept = true
+
+  tags = "${merge(var.tags, map("Name", "${var.env_name}-peering-to-pcf"))}"
+}
+
+resource "aws_instance" "squid_proxy" {
+  ami                    = "${data.aws_ami.ubuntu_ami}"
+  instance_type          = "t2.micro"
+  key_name               = "${aws_key_pair.squid_proxy.key_name}"
+  vpc_security_group_ids = ["${aws_security_group.ops_manager_security_group.id}"]
+  source_dest_check      = false
+  subnet_id              = "${element(aws_subnet.public_subnets.*.id, 0)}"
+  iam_instance_profile   = "${aws_iam_instance_profile.ops_manager.name}"
+  count                  = "${var.vm_count}"
+
+  network_interface {
+    network_interface_id = "${aws_network_interface.proxy.id}"
+    device_index         = 0
+  }
+
+  user_data = <<-EOF
+#!/bin/bash
+set -x
+sudo su -
+apt update
+apt install -y \
+    apt-transport-https \
+    ca-certificates \
+    squid
+mkdir -p /etc/squid
+cat > /etc/systemd/system/squid.service << '_END'
+[Unit]
+Description=Squid4 Docker Container
+Documentation=http://wiki.squid.org
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+ExecStartPre=-/usr/bin/docker kill squid4
+ExecStartPre=-/usr/bin/docker rm squid4
+ExecStart=/usr/bin/docker run --net=host --rm \
+    -v /srv/squid/cache:/var/cache/squid4 \
+    -v /etc/ssl/certs:/etc/ssl/certs:ro \
+    -v /etc/ssl/private/ca.key:/etc/squid4/ssl_cert/ca.key:ro \
+    -v /etc/ssl/certs/ca.crt:/etc/squid4/ssl_cert/ca.crt:ro \
+    -v /etc/ssl/certs/chain.pem:/etc/ssl/certs/chain.pem:ro \
+    -e CA_KEY=/ca.key \
+    -e CA_CERT=/ca.crt \
+    -e CA_CHAIN=/chain.pem \
+    -e MITM_PROXY=yes \
+    --name squid4 \
+    "${var.squid_docker_image}"
+
+[Install]
+WantedBy=multi-user.target
+_END
+cat > /etc/ssl/certs/ca.crt <<'_END'
+"${var.ssl_ca_cert}"
+_END
+cat > /etc/ssl/private/ca.key <<'_END'
+"${var.ssl_ca_private_key}"
+_END
+cat > /etc/ssl/certs/chain.pem <<'_END'
+"${var.ssl_ca_chain}"
+_END
+cat > /etc/squid/squid.conf <<'_END'
+visible_hostname squid
+
+#Handling HTTP requests
+http_port 3129 intercept
+# Do Not Allow ANY HTTP traffic.
+
+#Handling HTTPS requests
+https_port 3130 ssl-bump generate-host-certificates=on dynamic_cert_mem_cache_size=4MB \
+cert=/etc/squid/ca.crt \
+key=/etc/squid/ca.key \
+cafile=/etc/squid/chain.pem intercept
+sslproxy_flags DONT_VERIFY_PEER
+sslproxy_cert_error deny all
+acl SSL_port port 443
+http_access allow SSL_port
+acl allowed_https_sites ssl::server_name iam.amazonaws.com
+#acl allowed_https_sites ssl::server_name [you can add other domains to permit]
+acl step1 at_step SslBump1
+acl step2 at_step SslBump2
+acl step3 at_step SslBump3
+ssl_bump peek step1 all
+ssl_bump peek step2 allowed_https_sites
+ssl_bump splice step3 allowed_https_sites
+ssl_bump terminate step2 all
+
+http_access deny all
+
+_END
+
+iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 3129
+iptables -t nat -A PREROUTING -p tcp --dport 443 -j REDIRECT --to-port 3130
+service iptables save
+EOF
+
+  root_block_device {
+    volume_type = "gp2"
+    volume_size = 150
+  }
+
+  tags = "${merge(var.tags, map("Name", "${var.env_name}-squid-proxy"))}"
+}
+
+resource "aws_key_pair" "squid_proxy" {
+  key_name   = "${var.env_name}-ops-manager-key"
+  public_key = "${tls_private_key.ops_manager.public_key_openssh}"
+}
+
+resource "tls_private_key" "ops_manager" {
+  algorithm = "RSA"
+  rsa_bits  = "4096"
+}
+
+data "aws_ami" "ubuntu_ami" {
+  most_recent = true
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-xenial-16.04-amd64-server-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+
+  owners = ["099720109477"] # Canonical
+}
+
+data "template_file" "squid_payload" {
+  template = "${file("squid_proxy.tpl")}"
+
+  vars = {
+    db_private_addr  = "${aws_instance.db.private_ip}"
+    db_password      = "${var.db_password}"
+    db_port          = "${var.db_port}"
+    zbx_private_addr = "${aws_instance.app.private_ip}"
+  }
+}
+
+resource "aws_network_interface" "proxy" {
+  subnet_id = "${element(aws_subnet.public_subnets.*.id, 0)}"
+
+  # Important to disable this check to allow traffic not addressed to the
+  # proxy to be received
+  source_dest_check = false
 }
