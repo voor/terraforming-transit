@@ -33,15 +33,23 @@ variable "directory_name" {
   default = ""
 }
 
-variable "directory_password" {}
-
 variable "tags" {
   type        = "map"
   default     = {}
   description = "Key/value tags to assign to all AWS resources"
 }
 
+module "cidr_lookup" {
+  source   = "../terraforming-aws/modules/calculate_subnets"
+  vpc_cidr = "${var.vpc_cidr}"
+}
+
 locals {
+  infrastructure_cidr = "${module.cidr_lookup.infrastructure_cidr}"
+
+  service_cidr = "${module.cidr_lookup.service_cidr}"
+
+  public_cidr    = "${module.cidr_lookup.public_cidr}"
   directory_name = "${var.directory_name != "" ? var.directory_name : "corp.${var.env_name}.${var.dns_suffix}" }"
 }
 
@@ -71,19 +79,6 @@ resource "aws_internet_gateway" "ig" {
   tags = "${var.tags}"
 }
 
-resource "aws_directory_service_directory" "directory" {
-  name     = "${local.directory_name}"
-  password = "${var.directory_password}"
-  size     = "Small"
-
-  vpc_settings {
-    vpc_id     = "${aws_vpc.transit_vpc.id}"
-    subnet_ids = ["${aws_subnet.infrastructure_subnets.*.id}"]
-  }
-
-  tags = "${merge(var.tags, map("Name", "${var.env_name}-directory"))}"
-}
-
 resource "aws_subnet" "infrastructure_subnets" {
   count             = "${length(var.availability_zones)}"
   vpc_id            = "${aws_vpc.transit_vpc.id}"
@@ -102,6 +97,39 @@ resource "aws_route_table" "public_route_table" {
   }
 }
 
+resource "aws_route_table" "deployment" {
+  count  = "${length(var.availability_zones)}"
+  vpc_id = "${aws_vpc.transit_vpc.id}"
+}
+
+resource "aws_route_table" "pcf_to_peering" {
+  vpc_id = "${aws_vpc.pcf_vpc.id}"
+
+  route {
+    cidr_block                = "${var.transit_vpc_cidr}"
+    vpc_peering_connection_id = "${aws_vpc_peering_connection.vpc_peering.id}"
+  }
+
+  tags = "${merge(var.tags, map("Name", "${var.env_name}-pcf-to-peering-route-table"))}"
+}
+
+resource "aws_route_table" "proxy_route_table" {
+  count  = "${length(var.availability_zones)}"
+  vpc_id = "${aws_vpc.transit_vpc.id}"
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = "${element(aws.nat_gateway.nat, count.index)}"
+  }
+
+  route {
+    cidr_block                = "${var.pcf_vpc_cidr}"
+    vpc_peering_connection_id = "${aws_vpc_peering_connection.vpc_peering.id}"
+  }
+
+  tags = "${merge(var.tags, map("Name", "${var.env_name}-nat-peering-route-table${count.index}"))}"
+}
+
 resource "aws_subnet" "public_subnets" {
   count             = "${length(var.availability_zones)}"
   vpc_id            = "${aws_vpc.transit_vpc.id}"
@@ -117,9 +145,20 @@ resource "aws_route_table_association" "route_public_subnets" {
   route_table_id = "${aws_route_table.public_route_table.id}"
 }
 
-resource "aws_route_table" "deployment" {
-  count  = "${length(var.availability_zones)}"
-  vpc_id = "${aws_vpc.transit_vpc.id}"
+resource "aws_subnet" "proxy_subnets" {
+  count                   = "${length(var.availability_zones)}"
+  vpc_id                  = "${aws_vpc.transit_vpc.id}"
+  cidr_block              = "${cidrsubnet(local.service_cidr, 2, count.index)}"
+  availability_zone       = "${element(var.availability_zones, count.index)}"
+  map_public_ip_on_launch = false
+
+  tags = "${merge(var.tags, map("Name", "${var.env_name}-proxy-subnet${count.index}"))}"
+}
+
+resource "aws_route_table_association" "route_proxy_subnets" {
+  count          = "${length(var.availability_zones)}"
+  subnet_id      = "${element(aws_subnet.proxy_subnets.*.id, count.index)}"
+  route_table_id = "${aws_route_table.proxy_route_table.id}"
 }
 
 resource "aws_security_group" "nat_security_group" {
@@ -223,16 +262,6 @@ resource "aws_route" "toggle_internet" {
   destination_cidr_block = "0.0.0.0/0"
 }
 
-module "cidr_lookup" {
-  source   = "../terraforming-aws/modules/calculate_subnets"
-  vpc_cidr = "${var.vpc_cidr}"
-}
-
-locals {
-  infrastructure_cidr = "${module.cidr_lookup.infrastructure_cidr}"
-  public_cidr         = "${module.cidr_lookup.public_cidr}"
-}
-
 resource "aws_vpc_peering_connection" "vpc_peering" {
   count       = "${var.pcf_vpc_id != "" ? 1 : 0}"
   peer_vpc_id = "${var.pcf_vpc_id}"
@@ -240,77 +269,4 @@ resource "aws_vpc_peering_connection" "vpc_peering" {
   auto_accept = true
 
   tags = "${merge(var.tags, map("Name", "${var.env_name}-peering-to-pcf"))}"
-}
-
-variable "ssl_ca_cert" {}
-
-variable "ssl_ca_private_key" {}
-
-resource "aws_instance" "squid_proxy" {
-  ami                    = "${data.aws_ami.ubuntu_ami}"
-  instance_type          = "t2.micro"
-  key_name               = "${aws_key_pair.squid_proxy.key_name}"
-  vpc_security_group_ids = ["${aws_security_group.ops_manager_security_group.id}"]
-  source_dest_check      = false
-  subnet_id              = "${element(aws_subnet.public_subnets.*.id, 0)}"
-  iam_instance_profile   = "${aws_iam_instance_profile.nat_security_group.name}"
-  count                  = "${var.vm_count}"
-
-  network_interface {
-    network_interface_id = "${aws_network_interface.proxy.id}"
-    device_index         = 0
-  }
-
-  user_data = "${data.tem.squid_payload}"
-
-  root_block_device {
-    volume_type = "gp2"
-    volume_size = 150
-  }
-
-  tags = "${merge(var.tags, map("Name", "${var.env_name}-squid-proxy"))}"
-}
-
-resource "aws_key_pair" "squid_proxy" {
-  key_name   = "${var.env_name}-squid-proxy-key"
-  public_key = "${tls_private_key.squid_proxy_key.public_key_openssh}"
-}
-
-resource "tls_private_key" "squid_proxy_key" {
-  algorithm = "RSA"
-  rsa_bits  = "4096"
-}
-
-data "aws_ami" "ubuntu_ami" {
-  most_recent = true
-
-  filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd/ubuntu-xenial-16.04-amd64-server-*"]
-  }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
-
-  owners = ["099720109477"] # Canonical
-}
-
-data "template_file" "squid_payload" {
-  template = "${file("squid_proxy.tpl")}"
-
-  vars = {
-    squid_docker_image = "${var.squid_docker_image}"
-    ssl_ca_cert        = "${var.ssl_ca_cert}"
-    ssl_ca_private_key = "${var.ssl_ca_private_key}"
-  }
-}
-
-resource "aws_network_interface" "proxy" {
-  subnet_id = "${element(aws_subnet.public_subnets.*.id, 0)}"
-
-  # Important to disable this check to allow traffic not addressed to the
-  # proxy to be received
-  source_dest_check = false
 }
