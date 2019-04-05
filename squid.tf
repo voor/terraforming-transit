@@ -1,31 +1,27 @@
-
 variable "ssl_ca_cert" {}
 
 variable "ssl_ca_private_key" {}
 
+variable "squid_docker_image" {
+  default = "voor/squid4"
+}
+
 resource "aws_instance" "squid_proxy" {
-  ami                    = "${data.aws_ami.ubuntu_ami}"
-  instance_type          = "t2.micro"
-  key_name               = "${aws_key_pair.squid_proxy.key_name}"
-  vpc_security_group_ids = ["${aws_security_group.ops_manager_security_group.id}"]
-  source_dest_check      = false
-  subnet_id              = "${element(aws_subnet.public_subnets.*.id, 0)}"
-  iam_instance_profile   = "${aws_iam_instance_profile.nat_security_group.name}"
-  count                  = "${var.vm_count}"
+  count         = "${length(var.availability_zones)}"
+  ami           = "${data.aws_ami.ubuntu_ami.id}"
+  instance_type = "t2.micro"
+  key_name      = "${aws_key_pair.squid_proxy.key_name}"
 
   network_interface {
-    network_interface_id = "${aws_network_interface.proxy.id}"
+    network_interface_id = "${element(aws_network_interface.proxy_interface.*.id, count.index)}"
     device_index         = 0
   }
-
-  user_data = "${data.tem.squid_payload}"
-
+  user_data = "${data.template_file.squid_payload.rendered}"
   root_block_device {
     volume_type = "gp2"
     volume_size = 150
   }
-
-  tags = "${merge(var.tags, map("Name", "${var.env_name}-squid-proxy"))}"
+  tags = "${merge(var.tags, map("Name", "${var.env_name}-squid-proxy-${element(var.availability_zones, count.index)}"))}"
 }
 
 resource "aws_key_pair" "squid_proxy" {
@@ -64,10 +60,15 @@ data "template_file" "squid_payload" {
   }
 }
 
-resource "aws_network_interface" "proxy" {
-  subnet_id = "${element(aws_subnet.public_subnets.*.id, 0)}"
+resource "aws_network_interface" "proxy_interface" {
+  count     = "${length(var.availability_zones)}"
+  subnet_id = "${element(aws_subnet.proxy_subnets.*.id, count.index)}"
+
+  security_groups = ["${aws_security_group.proxy_security_group.id}"]
 
   # Important to disable this check to allow traffic not addressed to the
   # proxy to be received
   source_dest_check = false
+
+  tags = "${merge(var.tags, map("Name", "${var.env_name}-squid-proxy-interface-${element(var.availability_zones, count.index)}"))}"
 }

@@ -1,0 +1,13 @@
+#!/bin/bash -exu
+
+main(){
+  local url
+  terraform output jumpbox_ssh_private_key > jumpbox.pem
+  chmod 600 jumpbox.pem
+  url="$(terraform output jumpbox_dns)" 
+
+  ssh -i jumpbox.pem "ubuntu@${url}"
+}
+
+main "$@"
+

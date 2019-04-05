@@ -123,7 +123,6 @@ iptables-save
 # Ephemeral Diffie-Hellman
 # openssl dhparam -outform PEM -out /etc/ssl/certs/dhparam.pem 4096
 
-# "${var.squid_docker_image}"
 docker pull ${squid_docker_image}
 systemctl daemon-reload
 systemctl enable squid4
