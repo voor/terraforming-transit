@@ -6,9 +6,14 @@ terraform {
   required_version = "< 0.12.0"
 }
 
-variable "vpc_cidr" {
+variable "transit_vpc_cidr" {
   type    = "string"
   default = "10.10.0.0/16"
+}
+
+variable "pcf_vpc_cidr" {
+  type    = "string"
+  default = "10.0.0.0/16"
 }
 
 variable "env_name" {}
@@ -17,10 +22,6 @@ variable "dns_suffix" {}
 
 variable "squid_docker_image" {
   default = "voor/squid4"
-}
-
-variable "pcf_vpc_id" {
-  default = ""
 }
 
 variable "availability_zones" {
@@ -44,8 +45,18 @@ locals {
   directory_name = "${var.directory_name != "" ? var.directory_name : "corp.${var.env_name}.${var.dns_suffix}" }"
 }
 
-resource "aws_vpc" "vpc" {
-  cidr_block = "${var.vpc_cidr}"
+resource "aws_vpc" "transit_vpc" {
+  cidr_block = "${var.transit_vpc_cidr}"
+
+  instance_tenancy     = "default"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = "${merge(var.tags, map("Name", "${var.env_name}-transit-vpc"))}"
+}
+
+resource "aws_vpc" "pcf_vpc" {
+  cidr_block = "${var.pcf_vpc_cidr}"
 
   instance_tenancy     = "default"
   enable_dns_support   = true
@@ -55,7 +66,7 @@ resource "aws_vpc" "vpc" {
 }
 
 resource "aws_internet_gateway" "ig" {
-  vpc_id = "${aws_vpc.vpc.id}"
+  vpc_id = "${aws_vpc.transit_vpc.id}"
 
   tags = "${var.tags}"
 }
@@ -66,7 +77,7 @@ resource "aws_directory_service_directory" "directory" {
   size     = "Small"
 
   vpc_settings {
-    vpc_id     = "${aws_vpc.vpc.id}"
+    vpc_id     = "${aws_vpc.transit_vpc.id}"
     subnet_ids = ["${aws_subnet.infrastructure_subnets.*.id}"]
   }
 
@@ -75,7 +86,7 @@ resource "aws_directory_service_directory" "directory" {
 
 resource "aws_subnet" "infrastructure_subnets" {
   count             = "${length(var.availability_zones)}"
-  vpc_id            = "${aws_vpc.vpc.id}"
+  vpc_id            = "${aws_vpc.transit_vpc.id}"
   cidr_block        = "${cidrsubnet(local.infrastructure_cidr, 2, count.index)}"
   availability_zone = "${element(var.availability_zones, count.index)}"
 
@@ -83,7 +94,7 @@ resource "aws_subnet" "infrastructure_subnets" {
 }
 
 resource "aws_route_table" "public_route_table" {
-  vpc_id = "${aws_vpc.vpc.id}"
+  vpc_id = "${aws_vpc.transit_vpc.id}"
 
   route {
     cidr_block = "0.0.0.0/0"
@@ -93,7 +104,7 @@ resource "aws_route_table" "public_route_table" {
 
 resource "aws_subnet" "public_subnets" {
   count             = "${length(var.availability_zones)}"
-  vpc_id            = "${aws_vpc.vpc.id}"
+  vpc_id            = "${aws_vpc.transit_vpc.id}"
   cidr_block        = "${cidrsubnet(local.public_cidr, 2, count.index)}"
   availability_zone = "${element(var.availability_zones, count.index)}"
 
@@ -108,19 +119,19 @@ resource "aws_route_table_association" "route_public_subnets" {
 
 resource "aws_route_table" "deployment" {
   count  = "${length(var.availability_zones)}"
-  vpc_id = "${aws_vpc.vpc.id}"
+  vpc_id = "${aws_vpc.transit_vpc.id}"
 }
 
 resource "aws_security_group" "nat_security_group" {
   name        = "nat_security_group"
   description = "NAT Security Group"
-  vpc_id      = "${aws_vpc.vpc.id}"
+  vpc_id      = "${aws_vpc.transit_vpc.id}"
 
   ingress {
-    cidr_blocks = ["${var.vpc_cidr}"]
-    protocol    = "-1"
-    from_port   = 0
-    to_port     = 0
+    security_groups = ["${aws_security_group.proxy_security_group.id}"]
+    protocol        = "-1"
+    from_port       = 0
+    to_port         = 0
   }
 
   egress {
@@ -133,24 +144,82 @@ resource "aws_security_group" "nat_security_group" {
   tags = "${merge(var.tags, map("Name", "${var.env_name}-nat-security-group"))}"
 }
 
-resource "aws_nat_gateway" "nat" {
-  allocation_id = "${aws_eip.nat_eip.id}"
-  subnet_id     = "${element(aws_subnet.public_subnets.*.id, 0)}"
+resource "aws_security_group" "jumpbox_security_group" {
+  name   = "${var.env_name}_jumpbox_security_group"
+  vpc_id = "${aws_vpc.transit_vpc.id}"
 
-  tags = "${merge(var.tags, map("Name", "${var.env_name}-nat"))}"
+  # SSH access only
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags {
+    Name = "${var.environment_name}_sg_1"
+  }
+}
+
+resource "aws_security_group" "proxy_security_group" {
+  name   = "${var.env_name}_proxy_security_group"
+  vpc_id = "${aws_vpc.transit_vpc.id}"
+
+  # SSH access from jumpbox security group
+  ingress {
+    from_port       = 22
+    to_port         = 22
+    protocol        = "tcp"
+    security_groups = ["${aws_security_group.jumpbox.id}"]
+  }
+
+  # Squid proxy port
+  ingress {
+    to_port     = "443"
+    protocol    = "tcp"
+    self        = true
+    cidr_blocks = ["${locals.infrastructure_cidr}"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags {
+    Name = "${var.environment_name}_sg_3"
+  }
+}
+
+resource "aws_nat_gateway" "nat" {
+  count         = "${length(var.availability_zones)}"
+  allocation_id = "${element(aws_eip.nat_eip.*.id, count.index)}"
+  subnet_id     = "${element(aws_subnet.public_subnets.*.id, count.index)}"
+
+  tags = "${merge(var.tags, map("Name", "${var.env_name}-nat-${element(var.availability_zones, count.index)}"))}"
 }
 
 resource "aws_eip" "nat_eip" {
-  vpc = true
+  count = "${length(var.availability_zones)}"
+  vpc   = true
 
-  tags = "${var.tags}"
+  tags = "${merge(var.tags, map("Name", "${var.env_name}-nat-eip-${element(var.availability_zones, count.index)}"))}"
 }
 
 resource "aws_route" "toggle_internet" {
   count = "${length(var.availability_zones)}"
 
   route_table_id         = "${element(aws_route_table.deployment.*.id, count.index)}"
-  nat_gateway_id         = "${aws_nat_gateway.nat.id}"
+  nat_gateway_id         = "${element(aws_nat_gateway.nat.*.id, count.index)}"
   destination_cidr_block = "0.0.0.0/0"
 }
 
@@ -173,6 +242,10 @@ resource "aws_vpc_peering_connection" "vpc_peering" {
   tags = "${merge(var.tags, map("Name", "${var.env_name}-peering-to-pcf"))}"
 }
 
+variable "ssl_ca_cert" {}
+
+variable "ssl_ca_private_key" {}
+
 resource "aws_instance" "squid_proxy" {
   ami                    = "${data.aws_ami.ubuntu_ami}"
   instance_type          = "t2.micro"
@@ -180,7 +253,7 @@ resource "aws_instance" "squid_proxy" {
   vpc_security_group_ids = ["${aws_security_group.ops_manager_security_group.id}"]
   source_dest_check      = false
   subnet_id              = "${element(aws_subnet.public_subnets.*.id, 0)}"
-  iam_instance_profile   = "${aws_iam_instance_profile.ops_manager.name}"
+  iam_instance_profile   = "${aws_iam_instance_profile.nat_security_group.name}"
   count                  = "${var.vm_count}"
 
   network_interface {
@@ -188,85 +261,7 @@ resource "aws_instance" "squid_proxy" {
     device_index         = 0
   }
 
-  user_data = <<-EOF
-#!/bin/bash
-set -x
-sudo su -
-apt update
-apt install -y \
-    apt-transport-https \
-    ca-certificates \
-    squid
-mkdir -p /etc/squid
-cat > /etc/systemd/system/squid.service << '_END'
-[Unit]
-Description=Squid4 Docker Container
-Documentation=http://wiki.squid.org
-After=network.target docker.service
-Requires=docker.service
-
-[Service]
-ExecStartPre=-/usr/bin/docker kill squid4
-ExecStartPre=-/usr/bin/docker rm squid4
-ExecStart=/usr/bin/docker run --net=host --rm \
-    -v /srv/squid/cache:/var/cache/squid4 \
-    -v /etc/ssl/certs:/etc/ssl/certs:ro \
-    -v /etc/ssl/private/ca.key:/etc/squid4/ssl_cert/ca.key:ro \
-    -v /etc/ssl/certs/ca.crt:/etc/squid4/ssl_cert/ca.crt:ro \
-    -v /etc/ssl/certs/chain.pem:/etc/ssl/certs/chain.pem:ro \
-    -e CA_KEY=/ca.key \
-    -e CA_CERT=/ca.crt \
-    -e CA_CHAIN=/chain.pem \
-    -e MITM_PROXY=yes \
-    --name squid4 \
-    "${var.squid_docker_image}"
-
-[Install]
-WantedBy=multi-user.target
-_END
-cat > /etc/ssl/certs/ca.crt <<'_END'
-"${var.ssl_ca_cert}"
-_END
-cat > /etc/ssl/private/ca.key <<'_END'
-"${var.ssl_ca_private_key}"
-_END
-cat > /etc/ssl/certs/chain.pem <<'_END'
-"${var.ssl_ca_chain}"
-_END
-cat > /etc/squid/squid.conf <<'_END'
-visible_hostname squid
-
-#Handling HTTP requests
-http_port 3129 intercept
-# Do Not Allow ANY HTTP traffic.
-
-#Handling HTTPS requests
-https_port 3130 ssl-bump generate-host-certificates=on dynamic_cert_mem_cache_size=4MB \
-cert=/etc/squid/ca.crt \
-key=/etc/squid/ca.key \
-cafile=/etc/squid/chain.pem intercept
-sslproxy_flags DONT_VERIFY_PEER
-sslproxy_cert_error deny all
-acl SSL_port port 443
-http_access allow SSL_port
-acl allowed_https_sites ssl::server_name iam.amazonaws.com
-#acl allowed_https_sites ssl::server_name [you can add other domains to permit]
-acl step1 at_step SslBump1
-acl step2 at_step SslBump2
-acl step3 at_step SslBump3
-ssl_bump peek step1 all
-ssl_bump peek step2 allowed_https_sites
-ssl_bump splice step3 allowed_https_sites
-ssl_bump terminate step2 all
-
-http_access deny all
-
-_END
-
-iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 3129
-iptables -t nat -A PREROUTING -p tcp --dport 443 -j REDIRECT --to-port 3130
-service iptables save
-EOF
+  user_data = "${data.tem.squid_payload}"
 
   root_block_device {
     volume_type = "gp2"
@@ -277,11 +272,11 @@ EOF
 }
 
 resource "aws_key_pair" "squid_proxy" {
-  key_name   = "${var.env_name}-ops-manager-key"
-  public_key = "${tls_private_key.ops_manager.public_key_openssh}"
+  key_name   = "${var.env_name}-squid-proxy-key"
+  public_key = "${tls_private_key.squid_proxy_key.public_key_openssh}"
 }
 
-resource "tls_private_key" "ops_manager" {
+resource "tls_private_key" "squid_proxy_key" {
   algorithm = "RSA"
   rsa_bits  = "4096"
 }
@@ -306,10 +301,9 @@ data "template_file" "squid_payload" {
   template = "${file("squid_proxy.tpl")}"
 
   vars = {
-    db_private_addr  = "${aws_instance.db.private_ip}"
-    db_password      = "${var.db_password}"
-    db_port          = "${var.db_port}"
-    zbx_private_addr = "${aws_instance.app.private_ip}"
+    squid_docker_image = "${var.squid_docker_image}"
+    ssl_ca_cert        = "${var.ssl_ca_cert}"
+    ssl_ca_private_key = "${var.ssl_ca_private_key}"
   }
 }
 
