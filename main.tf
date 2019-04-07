@@ -89,7 +89,7 @@ resource "aws_subnet" "infrastructure_subnets" {
   cidr_block        = "${cidrsubnet(local.infrastructure_cidr, 2, count.index)}"
   availability_zone = "${element(var.availability_zones, count.index)}"
 
-  tags = "${merge(var.tags, map("Name", "${var.env_name}-infrastructure-subnet${count.index}"))}"
+  tags = "${merge(var.tags, map("Name", "${var.env_name}-infrastructure-subnet-${element(var.availability_zones, count.index)}"))}"
 }
 
 resource "aws_subnet" "public_subnets" {
@@ -98,7 +98,7 @@ resource "aws_subnet" "public_subnets" {
   cidr_block        = "${cidrsubnet(local.public_cidr, 2, count.index)}"
   availability_zone = "${element(var.availability_zones, count.index)}"
 
-  tags = "${merge(var.tags, map("Name", "${var.env_name}-public-subnet${count.index}"))}"
+  tags = "${merge(var.tags, map("Name", "${var.env_name}-public-subnet-${element(var.availability_zones, count.index)}"))}"
 }
 
 resource "aws_subnet" "proxy_subnets" {
@@ -108,7 +108,7 @@ resource "aws_subnet" "proxy_subnets" {
   availability_zone       = "${element(var.availability_zones, count.index)}"
   map_public_ip_on_launch = false
 
-  tags = "${merge(var.tags, map("Name", "${var.env_name}-proxy-subnet${count.index}"))}"
+  tags = "${merge(var.tags, map("Name", "${var.env_name}-proxy-subnet-${element(var.availability_zones, count.index)}"))}"
 }
 
 resource "aws_route_table" "public_route_table" {
@@ -120,16 +120,16 @@ resource "aws_route_table" "public_route_table" {
   }
 }
 
-resource "aws_route_table" "deployment" {
-  count  = "${length(var.availability_zones)}"
-  vpc_id = "${aws_vpc.transit_vpc.id}"
-}
-
-resource "aws_route_table" "pcf_to_peering" {
-  vpc_id = "${aws_vpc.pcf_vpc.id}"
+resource "aws_default_route_table" "pcf_to_peering" {
+  default_route_table_id = "${aws_vpc.pcf_vpc.default_route_table_id}"
 
   route {
     cidr_block                = "${var.transit_vpc_cidr}"
+    vpc_peering_connection_id = "${aws_vpc_peering_connection.vpc_peering.id}"
+  }
+
+  route {
+    cidr_block                = "0.0.0.0/0"
     vpc_peering_connection_id = "${aws_vpc_peering_connection.vpc_peering.id}"
   }
 
@@ -150,7 +150,7 @@ resource "aws_route_table" "proxy_route_table" {
     vpc_peering_connection_id = "${aws_vpc_peering_connection.vpc_peering.id}"
   }
 
-  tags = "${merge(var.tags, map("Name", "${var.env_name}-nat-peering-route-table${count.index}"))}"
+  tags = "${merge(var.tags, map("Name", "${var.env_name}-nat-peering-route-table-${element(var.availability_zones, count.index)}"))}"
 }
 
 resource "aws_route_table" "jumpbox_route_table" {
@@ -167,7 +167,7 @@ resource "aws_route_table" "jumpbox_route_table" {
     vpc_peering_connection_id = "${aws_vpc_peering_connection.vpc_peering.id}"
   }
 
-  tags = "${merge(var.tags, map("Name", "${var.env_name}-nat-peering-route-table${count.index}"))}"
+  tags = "${merge(var.tags, map("Name", "${var.env_name}-nat-peering-route-table-${element(var.availability_zones, count.index)}"))}"
 }
 
 resource "aws_route_table_association" "route_public_subnets" {
@@ -180,13 +180,6 @@ resource "aws_route_table_association" "route_proxy_subnets" {
   count          = "${length(var.availability_zones)}"
   subnet_id      = "${element(aws_subnet.proxy_subnets.*.id, count.index)}"
   route_table_id = "${element(aws_route_table.proxy_route_table.*.id, count.index)}"
-}
-
-resource "aws_route" "proxy_route" {
-  count                  = "${length(var.availability_zones)}"
-  route_table_id         = "${aws_route_table.pcf_to_peering.id}"
-  destination_cidr_block = "0.0.0.0/0"
-  network_interface_id   = "${element(aws_network_interface.proxy_interface.*.id, count.index)}"
 }
 
 resource "aws_security_group" "nat_security_group" {
@@ -209,28 +202,6 @@ resource "aws_security_group" "nat_security_group" {
   }
 
   tags = "${merge(var.tags, map("Name", "${var.env_name}-nat-security-group"))}"
-}
-
-resource "aws_security_group" "jumpbox_security_group" {
-  name   = "${var.env_name}_jumpbox_security_group"
-  vpc_id = "${aws_vpc.transit_vpc.id}"
-
-  # SSH access only
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = "${merge(var.tags, map("Name", "${var.env_name}-jumpbox-security-group"))}"
 }
 
 resource "aws_security_group" "proxy_security_group" {

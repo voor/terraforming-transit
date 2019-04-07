@@ -22,7 +22,7 @@ resource "aws_instance" "jumpbox" {
   key_name      = "${aws_key_pair.jumpbox_pair.key_name}"
 
   subnet_id       = "${element(aws_subnet.public_subnets.*.id, count.index)}"
-  security_groups = ["${aws_security_group.jumpbox_security_group.id}"]
+  vpc_security_group_ids = ["${aws_security_group.jumpbox_security_group.id}"]
 
   root_block_device {
     volume_type = "gp2"
@@ -32,9 +32,31 @@ resource "aws_instance" "jumpbox" {
   tags = "${merge(var.tags, map("Name", "${var.env_name}-jumpbox-${element(var.availability_zones, count.index)}"))}"
 }
 
+resource "aws_security_group" "jumpbox_security_group" {
+  name   = "${var.env_name}_jumpbox_security_group"
+  vpc_id = "${aws_vpc.transit_vpc.id}"
+
+  # SSH access only
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = "${merge(var.tags, map("Name", "${var.env_name}-jumpbox-security-group"))}"
+}
+
 resource "aws_key_pair" "jumpbox_pair" {
   key_name   = "${var.env_name}-jumpbox-key"
-  public_key = "${tls_private_key.squid_proxy_key.public_key_openssh}"
+  public_key = "${tls_private_key.jumpbox_key.public_key_openssh}"
 }
 
 resource "tls_private_key" "jumpbox_key" {
