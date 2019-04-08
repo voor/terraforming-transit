@@ -80,7 +80,7 @@ resource "aws_vpc" "pcf_vpc" {
 resource "aws_internet_gateway" "ig" {
   vpc_id = "${aws_vpc.transit_vpc.id}"
 
-  tags = "${var.tags}"
+  tags = "${merge(var.tags, map("Name", "${var.env_name}-internet-gateway"))}"
 }
 
 resource "aws_subnet" "infrastructure_subnets" {
@@ -118,6 +118,11 @@ resource "aws_route_table" "public_route_table" {
     cidr_block = "0.0.0.0/0"
     gateway_id = "${aws_internet_gateway.ig.id}"
   }
+
+  route {
+    cidr_block                = "${var.pcf_vpc_cidr}"
+    vpc_peering_connection_id = "${aws_vpc_peering_connection.vpc_peering.id}"
+  }
 }
 
 resource "aws_default_route_table" "pcf_to_peering" {
@@ -141,13 +146,13 @@ resource "aws_route_table" "proxy_route_table" {
   vpc_id = "${aws_vpc.transit_vpc.id}"
 
   route {
-    cidr_block     = "0.0.0.0/0"
-    nat_gateway_id = "${element(aws_nat_gateway.nat.*.id, count.index)}"
+    cidr_block                = "${var.pcf_vpc_cidr}"
+    vpc_peering_connection_id = "${aws_vpc_peering_connection.vpc_peering.id}"
   }
 
   route {
-    cidr_block                = "${var.pcf_vpc_cidr}"
-    vpc_peering_connection_id = "${aws_vpc_peering_connection.vpc_peering.id}"
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = "${element(aws_nat_gateway.nat.*.id, count.index)}"
   }
 
   tags = "${merge(var.tags, map("Name", "${var.env_name}-nat-peering-route-table-${element(var.availability_zones, count.index)}"))}"
@@ -218,11 +223,19 @@ resource "aws_security_group" "proxy_security_group" {
 
   # Squid proxy port
   ingress {
-    from_port   = 0
-    to_port     = "443"
+    from_port   = 80
+    to_port     = 80
     protocol    = "tcp"
     self        = true
-    cidr_blocks = ["${local.infrastructure_cidr}"]
+    cidr_blocks = ["${local.infrastructure_cidr}", "${var.pcf_vpc_cidr}"]
+  }
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    self        = true
+    cidr_blocks = ["${local.infrastructure_cidr}", "${var.pcf_vpc_cidr}"]
   }
 
   egress {

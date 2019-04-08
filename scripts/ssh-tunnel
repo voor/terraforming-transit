@@ -1,0 +1,17 @@
+#!/bin/bash -exu
+
+main(){
+  local url
+  terraform output jumpbox_ssh_private_key > jumpbox.pem
+  chmod 600 jumpbox.pem
+  url="$(terraform output jumpbox_dns)" 
+
+  ssh -N -L "2222":"${1}":"22" -i jumpbox.pem -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no "ubuntu@${url}"
+}
+
+if [ $# -eq 0 ]; then
+  echo "Please specifiy the IP Address for the instance to reach."
+  exit 1
+fi
+main "$@"
+

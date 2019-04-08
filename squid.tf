@@ -16,11 +16,14 @@ resource "aws_instance" "squid_proxy" {
     network_interface_id = "${element(aws_network_interface.proxy_interface.*.id, count.index)}"
     device_index         = 0
   }
+
   user_data = "${data.template_file.squid_payload.rendered}"
+
   root_block_device {
     volume_type = "gp2"
     volume_size = 150
   }
+
   tags = "${merge(var.tags, map("Name", "${var.env_name}-squid-proxy-${element(var.availability_zones, count.index)}"))}"
 }
 

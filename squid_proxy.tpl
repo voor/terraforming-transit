@@ -13,7 +13,6 @@ apt install -y \
     ca-certificates \
     curl \
     software-properties-common \
-    iptables-persistent \
     docker-ce
 
 mkdir -p /etc/squid4/certificates/ /var/cache/squid4 
@@ -70,7 +69,7 @@ http_access deny !Safe_ports
 
 
 # Handling HTTPS requests
-https_port 3130 cert=/etc/ssl/certs/ca.pem key=/etc/squid4/certificates/ca.key ssl-bump intercept
+https_port 443 cert=/etc/ssl/certs/ca.pem key=/etc/squid4/certificates/ca.key ssl-bump intercept
 
 ssl_bump bump all
 
@@ -96,7 +95,7 @@ acl allowed_https_sites ssl::server_name iam.us-gov.amazonaws.com
 
 http_access allow allowed_https_sites
 
-http_port 3128
+http_port 80
 
 # Handling HTTP requests
 http_port 3129 intercept
@@ -107,18 +106,7 @@ _END
 chmod 644 /etc/squid4/certificates/ca.key
 chown 13:13 -R /etc/squid4 /var/cache/squid4
 chmod 644 /etc/ssl/certs/ca.pem
-chmod 644 /etc/ssl/certs/chain.pem 
 chmod 644 /etc/systemd/system/squid4.service
-
-iptables -t nat -C PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 3129
-if [ $? -ne 0 ]; then
-  iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 3129
-fi
-iptables -t nat -C PREROUTING -p tcp --dport 443 -j REDIRECT --to-port 3130
-if [ $? -ne 0 ]; then
-  iptables -t nat -A PREROUTING -p tcp --dport 443 -j REDIRECT --to-port 3130
-fi
-iptables-save
 
 # Ephemeral Diffie-Hellman
 # openssl dhparam -outform PEM -out /etc/ssl/certs/dhparam.pem 4096
