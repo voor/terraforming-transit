@@ -21,7 +21,7 @@ resource "aws_instance" "jumpbox" {
   instance_type = "t2.micro"
   key_name      = "${aws_key_pair.jumpbox_pair.key_name}"
 
-  subnet_id       = "${element(aws_subnet.public_subnets.*.id, count.index)}"
+  subnet_id              = "${element(aws_subnet.public_subnets.*.id, count.index)}"
   vpc_security_group_ids = ["${aws_security_group.jumpbox_security_group.id}"]
 
   root_block_device {
@@ -65,7 +65,8 @@ resource "tls_private_key" "jumpbox_key" {
 }
 
 output "jumpbox_ssh_private_key" {
-  value = "${element(concat(tls_private_key.jumpbox_key.*.private_key_pem, list("")), 0)}"
+  value     = "${element(concat(tls_private_key.jumpbox_key.*.private_key_pem, list("")), 0)}"
+  sensitive = true
 }
 
 resource "aws_eip" "jumpbox_eip" {
